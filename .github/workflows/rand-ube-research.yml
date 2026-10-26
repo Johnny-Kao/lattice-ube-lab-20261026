@@ -95,7 +95,7 @@ jobs:
         run: |
           set -euxo pipefail
           cmake -S /tmp/awslc-patched -B /tmp/build-patched -GNinja \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DDISABLE_GO=ON -DBUILD_TESTING=ON
           cmake --build /tmp/build-patched --parallel "$(nproc)"
 
       - name: Compile research benchmark binaries
