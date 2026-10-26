@@ -156,16 +156,13 @@ jobs:
             --mode rand --out-dir research-results/rand-end-to-end --repeats 11
           cat research-results/rand-end-to-end/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run AWS-LC test suite on patched build
+      - name: Run official AWS-LC run_minimal_tests target
         shell: bash
         run: |
-          set -o pipefail
-          ctest --test-dir /tmp/build-patched \
-            --output-on-failure --parallel "$(nproc)" \
-            2>&1 | tee research-results/ctest-patched.txt
-          if grep -q "No tests were found" research-results/ctest-patched.txt; then
-            echo "WARNING: upstream CTest discovery returned no tests; not a correctness PASS" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          set -euxo pipefail
+          cmake --build /tmp/build-patched --target run_minimal_tests \
+            2>&1 | tee research-results/upstream-minimal-tests.txt
+          echo "Official upstream run_minimal_tests target completed." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload research results
         if: always()
