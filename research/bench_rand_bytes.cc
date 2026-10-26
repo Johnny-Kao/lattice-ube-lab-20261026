@@ -1,4 +1,7 @@
 #include <openssl/rand.h>
+#include <cstdint>
+
+extern "C" uint64_t CRYPTO_get_fork_ube_generation(void);
 
 #include <atomic>
 #include <chrono>
@@ -15,7 +18,7 @@ static std::atomic<bool> failed{false};
 static std::atomic<uint64_t> checksum{0};
 
 static void worker(size_t bytes, uint64_t iterations) {
-  std::vector<uint8_t> out(bytes);
+  std::vector<uint8_t> out(bytes ? bytes : 32);
 
   // Initialize this thread's AWS-LC thread-local DRBG before the timed region.
   for (int i = 0; i < 100; ++i) {
@@ -32,13 +35,15 @@ static void worker(size_t bytes, uint64_t iterations) {
 
   uint64_t local = 0;
   for (uint64_t i = 0; i < iterations; ++i) {
-    if (RAND_bytes(out.data(), out.size()) != 1) {
-      failed.store(true, std::memory_order_relaxed);
-      return;
+    if (bytes == 0) {
+      local ^= CRYPTO_get_fork_ube_generation();
+    } else {
+      if (RAND_bytes(out.data(), out.size()) != 1) {
+        failed.store(true, std::memory_order_relaxed);
+        return;
+      }
+      local ^= out[(i + bytes - 1) % bytes];
     }
-    // Keep a tiny observable dependency outside AWS-LC. One byte is enough to
-    // prevent the caller from treating the generated buffer as dead.
-    local ^= out[(i + bytes - 1) % bytes];
   }
   checksum.fetch_xor(local, std::memory_order_relaxed);
 }
@@ -52,7 +57,7 @@ int main(int argc, char **argv) {
   int threads = std::atoi(argv[1]);
   size_t bytes = static_cast<size_t>(std::strtoull(argv[2], nullptr, 10));
   uint64_t iterations = std::strtoull(argv[3], nullptr, 10);
-  if (threads < 1 || bytes < 1 || iterations < 1) return 2;
+  if (threads < 1 || iterations < 1) return 2;
 
   ready.store(0, std::memory_order_relaxed);
   go.store(false, std::memory_order_relaxed);

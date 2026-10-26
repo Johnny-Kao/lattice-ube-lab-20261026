@@ -27,11 +27,8 @@ def run_one(binary, threads, size, iterations):
 
 
 def iterations_for(size):
-    if size <= 32:
-        return 120000
-    if size <= 256:
-        return 80000
-    return 20000
+    # Constant call count across input sizes; avoids short 4096-byte trials.
+    return 100000
 
 
 def main():
@@ -39,7 +36,8 @@ def main():
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--patched", required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--repeats", type=int, default=7)
+    ap.add_argument("--repeats", type=int, default=11)
+    ap.add_argument("--mode", choices=["rand", "fork"], default="rand")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -48,7 +46,7 @@ def main():
     native_max = min(cpus, 8)
     thread_counts = sorted(set([1, 2, min(4, cpus), native_max, min(16, cpus * 2)]))
     thread_counts = [t for t in thread_counts if t >= 1]
-    sizes = [16, 32, 256, 4096]
+    sizes = [0] if args.mode == "fork" else [16, 32, 256, 4096]
 
     rows = []
     for size in sizes:
@@ -90,7 +88,7 @@ def main():
 
     md = out_dir / "SUMMARY.md"
     with md.open("w") as f:
-        f.write("# AWS-LC RAND/UBE benchmark summary\n\n")
+        f.write(f"# AWS-LC {args.mode} baseline vs patched benchmark\n\n")
         f.write(f"Runner logical CPUs: **{cpus}**  \n")
         f.write(f"Repetitions per cell: **{args.repeats}**\n\n")
         f.write("| Threads | RAND bytes | Baseline median ns/op | Patched median ns/op | Improvement |\n")
@@ -98,9 +96,10 @@ def main():
         for threads, size, bmed, pmed, imp in summary:
             f.write(f"| {threads} | {size} | {bmed:.2f} | {pmed:.2f} | {imp:+.2f}% |\n")
 
-        target = [x for x in summary if x[0] == native_max and x[1] == 32][0]
+        primary_size = 0 if args.mode == "fork" else 32
+        target = [x for x in summary if x[0] == native_max and x[1] == primary_size][0]
         imp = target[4]
-        one_thread = [x for x in summary if x[0] == 1 and x[1] == 32][0][4]
+        one_thread = [x for x in summary if x[0] == 1 and x[1] == primary_size][0][4]
         f.write("\n## Automated research gate\n\n")
         f.write(f"Primary cell: 32-byte RAND at {native_max} native threads: **{imp:+.2f}%**.  \n")
         f.write(f"1-thread 32-byte change: **{one_thread:+.2f}%**.\n\n")

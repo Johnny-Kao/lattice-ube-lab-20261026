@@ -136,16 +136,25 @@ jobs:
           /tmp/fork-baseline 100 | tee research-results/fork-baseline.txt
           /tmp/fork-patched 100 | tee research-results/fork-patched.txt
 
-      - name: Benchmark RAND_bytes baseline vs patched
+      - name: Benchmark fork detection only baseline vs patched
         shell: bash
         run: |
           set -euxo pipefail
           python3 research/run_rand_bench.py \
             --baseline /tmp/bench-baseline \
             --patched /tmp/bench-patched \
-            --out-dir research-results \
-            --repeats 7
-          cat research-results/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+            --mode fork --out-dir research-results/fork-only --repeats 11
+          cat research-results/fork-only/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Benchmark RAND_bytes baseline vs patched independently
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 research/run_rand_bench.py \
+            --baseline /tmp/bench-baseline \
+            --patched /tmp/bench-patched \
+            --mode rand --out-dir research-results/rand-end-to-end --repeats 11
+          cat research-results/rand-end-to-end/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run AWS-LC test suite on patched build
         shell: bash
@@ -154,6 +163,9 @@ jobs:
           ctest --test-dir /tmp/build-patched \
             --output-on-failure --parallel "$(nproc)" \
             2>&1 | tee research-results/ctest-patched.txt
+          if grep -q "No tests were found" research-results/ctest-patched.txt; then
+            echo "WARNING: upstream CTest discovery returned no tests; not a correctness PASS" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload research results
         if: always()
