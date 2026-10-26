@@ -34,7 +34,7 @@ jobs:
               data = p.read_text()
               needle = "\n#elif defined(AWSLC_PLATFORM_DOES_NOT_FORK)"
               assert data.count(needle) == 1
-              data = data.replace(needle, "\nuintptr_t AWSLC_test_fork_flag_address(void) { return (uintptr_t)fork_detect_addr; }\n" + needle)
+              data = data.replace(needle, "\nuintptr_t AWSLC_test_fork_flag_address(void);\nuintptr_t AWSLC_test_fork_flag_address(void) { return (uintptr_t)fork_detect_addr; }\n" + needle)
               p.write_text(data)
           PY
           for variant in base patch; do
