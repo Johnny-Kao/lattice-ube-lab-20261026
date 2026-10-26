@@ -127,6 +127,12 @@ jobs:
               echo "$variant $kind build=$build_rc run=$run_rc" | tee -a safety-results/differential-status.txt
               if [ "$run_rc" -ne 0 ]; then failures=$((failures+1)); fi
             done
+            # Separately test RAND reseeding during external page reset.
+            timeout --kill-after=3s 60s "/tmp/kernel_wipe_differential-$variant" 80 1 \
+              >"safety-results/wipe-with-rand-$variant.log" 2>&1
+            rand_rc=$?
+            echo "$variant wipe-with-rand run=$rand_rc" | tee -a safety-results/differential-status.txt
+            if [ "$rand_rc" -ne 0 ]; then failures=$((failures+1)); fi
             lib="/tmp/awslc-$variant-build/crypto/libcrypto.a"
             clang++ -g -O1 -std=c++17 -pthread -fsanitize=thread -fno-omit-frame-pointer \
               -I"/tmp/awslc-$variant/include" research/kernel_wipe_differential.cc "$lib" \

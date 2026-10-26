@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#include <execinfo.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <thread>
@@ -16,8 +18,20 @@
 extern "C" uint64_t CRYPTO_get_fork_ube_generation(void);
 extern "C" uintptr_t AWSLC_test_fork_flag_address(void);
 
+static void abort_trace(int sig) {
+  const char msg[] = "TRACE: caught SIGABRT in kernel wipe differential\n";
+  (void)write(STDERR_FILENO, msg, sizeof(msg)-1);
+  void *frames[32];
+  int count = backtrace(frames, 32);
+  backtrace_symbols_fd(frames, count, STDERR_FILENO);
+  _exit(128 + sig);
+}
+
 int main(int argc, char** argv) {
+  signal(SIGABRT, abort_trace);
   const int rounds = argc > 1 ? atoi(argv[1]) : 200;
+  const bool rand_workload = argc > 2 && atoi(argv[2]) != 0;
+  fprintf(stderr, "BEGIN rounds=%d RAND_worker=%d\n", rounds, rand_workload);
   if (rounds < 1) return 2;
   uint64_t prior = CRYPTO_get_fork_ube_generation();
   uintptr_t p = AWSLC_test_fork_flag_address();
@@ -41,7 +55,7 @@ int main(int argc, char** argv) {
         const uint64_t now = CRYPTO_get_fork_ube_generation();
         if (now == 0 || now < prev) violation.store(true);
         prev = now;
-        if (RAND_bytes(bytes, sizeof(bytes)) != 1) violation.store(true);
+        if (rand_workload && RAND_bytes(bytes, sizeof(bytes)) != 1) violation.store(true);
         calls.fetch_add(1, std::memory_order_relaxed);
         per_thread[t].fetch_add(1, std::memory_order_relaxed);
       }
@@ -82,6 +96,7 @@ int main(int argc, char** argv) {
       violation.store(true); break;
     }
     passed++;
+    if ((i % 25) == 0) fprintf(stderr, "PROGRESS wipe=%d calls=%llu\n", i, (unsigned long long)calls.load());
   }
   stop.store(true);
   for (auto &t: workers) t.join();
