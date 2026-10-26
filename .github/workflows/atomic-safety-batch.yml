@@ -11,10 +11,16 @@ jobs:
     timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
-      - name: Install once
+      - name: Verify runner toolchain (no apt installation)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang build-essential cmake ninja-build patch python3
+          set -euxo pipefail
+          command -v git
+          command -v clang
+          command -v clang++
+          command -v cmake
+          command -v ninja
+          command -v patch
+          command -v python3
       - name: Exact source and two sanitizer builds
         shell: bash
         run: |
