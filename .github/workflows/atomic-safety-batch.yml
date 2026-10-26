@@ -1,0 +1,72 @@
+name: AWS-LC final atomic safety batch
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install once
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang build-essential cmake ninja-build patch python3
+      - name: Exact source and two sanitizer builds
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone https://github.com/aws/aws-lc.git /tmp/awslc-base
+          git -C /tmp/awslc-base checkout --detach cd481c207e38f06aeb5766f4a1cdfce10a4c0af8
+          git -C /tmp/awslc-base submodule update --init --recursive
+          cp -a /tmp/awslc-base /tmp/awslc-patch
+          cd /tmp/awslc-patch
+          patch -p1 --dry-run < "$GITHUB_WORKSPACE/research/atomic-fork-fastpath.patch"
+          patch -p1 < "$GITHUB_WORKSPACE/research/atomic-fork-fastpath.patch"
+          for variant in base patch; do
+            cmake -S "/tmp/awslc-$variant" -B "/tmp/awslc-$variant-build" -GNinja \
+              -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=ON \
+              -DDISABLE_GO=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+              -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+              -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+              -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+            cmake --build "/tmp/awslc-$variant-build" --target crypto --parallel "$(nproc)"
+          done
+      - name: Differential atomic and fork scenarios — always capture both
+        shell: bash
+        run: |
+          mkdir -p safety-results
+          set +e
+          for variant in base patch; do
+            lib="/tmp/awslc-$variant-build/crypto/libcrypto.a"
+            clang++ -g -O1 -std=c++17 -pthread -fsanitize=thread -fno-omit-frame-pointer \
+              -I"/tmp/awslc-$variant/include" research/fork_generation_concurrency.cc "$lib" \
+              -ldl -lm -lrt -latomic -o "/tmp/check-$variant" \
+              >"safety-results/compile-$variant.log" 2>&1
+            compile_rc=$?
+            if [ "$compile_rc" -eq 0 ]; then
+              TSAN_OPTIONS="halt_on_error=1:exitcode=66" timeout --kill-after=3s 45s \
+                "/tmp/check-$variant" 30 >"safety-results/run-$variant.log" 2>&1
+              test_rc=$?
+            else
+              test_rc=125
+            fi
+            echo "$variant compile=$compile_rc run=$test_rc" | tee -a safety-results/status.txt
+          done
+          exit 0
+      - name: Collect compiler/OS and static memory-order evidence
+        shell: bash
+        run: |
+          mkdir -p safety-results
+          clang --version > safety-results/toolchain.txt
+          uname -a >> safety-results/toolchain.txt
+          rg -n 'atomic_|memory_order|fork_detect_addr|fgn|CRYPTO_STATIC_MUTEX' \
+            /tmp/awslc-patch/crypto/ube/fork_ube_detect.c > safety-results/atomic-source-lines.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: atomic-safety-batch
+          path: safety-results/

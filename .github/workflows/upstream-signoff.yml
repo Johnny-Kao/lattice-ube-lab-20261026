@@ -1,8 +1,6 @@
 name: AWS-LC upstream CI signoff
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 permissions:
   contents: read
 jobs:
