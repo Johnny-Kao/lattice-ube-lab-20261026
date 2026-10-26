@@ -29,22 +29,46 @@ int main(int argc, char** argv) {
   }
   std::atomic<bool> stop{false}, violation{false};
   std::atomic<uint64_t> calls{0};
+  std::atomic<int> ready{0};
+  std::atomic<uint64_t> per_thread[4]{};
   std::vector<std::thread> workers;
   for (int t = 0; t < 4; ++t) {
-    workers.emplace_back([&] {
+    workers.emplace_back([&, t] {
       uint64_t prev = prior;
       unsigned char bytes[32];
+      ready.fetch_add(1, std::memory_order_release);
       while (!stop.load(std::memory_order_relaxed)) {
         const uint64_t now = CRYPTO_get_fork_ube_generation();
         if (now == 0 || now < prev) violation.store(true);
         prev = now;
         if (RAND_bytes(bytes, sizeof(bytes)) != 1) violation.store(true);
         calls.fetch_add(1, std::memory_order_relaxed);
+        per_thread[t].fetch_add(1, std::memory_order_relaxed);
       }
     });
   }
   int passed = 0;
   for (int i=0; i<rounds; ++i) {
+    // Require real concurrent worker progress before EVERY kernel page reset.
+    // A very fast main thread could otherwise finish all wipes before workers run.
+    const uint64_t min_calls = 1000 + (uint64_t)(i + 1) * 128;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    auto all_progressed = [&] {
+      if (ready.load(std::memory_order_acquire) != 4) return false;
+      for (auto &counter : per_thread) {
+        if (counter.load(std::memory_order_relaxed) < min_calls / 4) return false;
+      }
+      return true;
+    };
+    while (!all_progressed() && !violation.load()) {
+      if (std::chrono::steady_clock::now() > deadline) {
+        fprintf(stderr, "FAIL workers not scheduled before wipe=%d count=%llu\n",
+                i, (unsigned long long)calls.load());
+        violation.store(true);
+        break;
+      }
+      std::this_thread::yield();
+    }
     if (violation.load()) break;
     const uint64_t before = CRYPTO_get_fork_ube_generation();
     if (madvise(reinterpret_cast<void*>(p), (size_t)pagesize, MADV_DONTNEED) != 0) {
