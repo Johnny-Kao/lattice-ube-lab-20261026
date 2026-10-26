@@ -129,12 +129,29 @@ jobs:
             research/fork_rand_correctness.c "$PATCH_LIB" \
             -ldl -lm -lrt -latomic -o /tmp/fork-patched
 
+          c++ -O2 -std=c++17 -pthread \
+            -I/tmp/awslc-baseline/include \
+            research/fork_generation_concurrency.cc "$BASE_LIB" \
+            -ldl -lm -lrt -latomic -o /tmp/fork-generation-baseline
+
+          c++ -O2 -std=c++17 -pthread \
+            -I/tmp/awslc-patched/include \
+            research/fork_generation_concurrency.cc "$PATCH_LIB" \
+            -ldl -lm -lrt -latomic -o /tmp/fork-generation-patched
+
       - name: Fork correctness smoke test
         shell: bash
         run: |
           set -euxo pipefail
           /tmp/fork-baseline 100 | tee research-results/fork-baseline.txt
           /tmp/fork-patched 100 | tee research-results/fork-patched.txt
+
+      - name: Concurrent fork generation regression baseline and patched
+        shell: bash
+        run: |
+          set -euxo pipefail
+          timeout 90s /tmp/fork-generation-baseline 100 | tee research-results/generation-baseline.txt
+          timeout 90s /tmp/fork-generation-patched 100 | tee research-results/generation-patched.txt
 
       - name: Benchmark fork detection only baseline vs patched
         shell: bash
