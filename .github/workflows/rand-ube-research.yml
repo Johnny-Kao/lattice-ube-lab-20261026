@@ -43,11 +43,9 @@ jobs:
               /tmp/aws-lc-upstream/ ./
             printf '%s\n' "$UPSTREAM_SHA" > research/UPSTREAM_COMMIT.txt
 
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -A
-            git commit -m "research: snapshot aws/aws-lc ${UPSTREAM_SHA} [skip ci]"
-            git push origin HEAD:main
+            # Keep the large upstream snapshot in the runner workspace.
+            # Publishing it via git push is not needed for this experiment
+            # and previously failed with a GitHub server error.
           else
             if [[ ! -f research/UPSTREAM_COMMIT.txt ]]; then
               printf '%s\n' "unknown-existing-snapshot" > research/UPSTREAM_COMMIT.txt
