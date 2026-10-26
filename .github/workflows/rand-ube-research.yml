@@ -174,20 +174,13 @@ jobs:
             2>&1 | tee research-results/upstream-minimal-tests.txt
           echo "Official upstream run_minimal_tests target completed." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Diagnose concurrent fork generation (non-gating, bounded)
+      - name: Validate quiescent multithreaded fork generation (gating)
         shell: bash
         run: |
-          set -uo pipefail
+          set -euxo pipefail
           for variant in baseline patched; do
-            set +e
-            timeout --kill-after=3s 15s "/tmp/fork-generation-${variant}" 5 > "research-results/generation-${variant}.txt" 2>&1
-            rc=$?
-            set -e
-            printf "%s exit=%s\\n" "$variant" "$rc" | tee -a research-results/generation-status.txt
-            cat "research-results/generation-${variant}.txt"
-            if [[ "$rc" -ne 0 ]]; then
-              echo "Concurrency stress ${variant}: INCONCLUSIVE/FAIL exit=${rc}; not a signoff PASS" >> "$GITHUB_STEP_SUMMARY"
-            fi
+            timeout --kill-after=3s 90s "/tmp/fork-generation-${variant}" 20 \
+              2>&1 | tee "research-results/generation-${variant}.txt"
           done
 
       - name: Upload research results
