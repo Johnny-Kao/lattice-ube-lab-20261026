@@ -26,6 +26,17 @@ jobs:
           cd /tmp/awslc-patch
           patch -p1 --dry-run < "$GITHUB_WORKSPACE/research/atomic-fork-fastpath.patch"
           patch -p1 < "$GITHUB_WORKSPACE/research/atomic-fork-fastpath.patch"
+          # Test-only symbol to locate the fork flag. Production logic unchanged.
+          python3 - <<'PY'
+          from pathlib import Path
+          for variant in ("base", "patch"):
+              p = Path(f"/tmp/awslc-{variant}/crypto/ube/fork_ube_detect.c")
+              data = p.read_text()
+              needle = "\n#elif defined(AWSLC_PLATFORM_DOES_NOT_FORK)"
+              assert data.count(needle) == 1
+              data = data.replace(needle, "\nuintptr_t AWSLC_test_fork_flag_address(void) { return (uintptr_t)fork_detect_addr; }\n" + needle)
+              p.write_text(data)
+          PY
           for variant in base patch; do
             cmake -S "/tmp/awslc-$variant" -B "/tmp/awslc-$variant-build" -GNinja \
               -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=ON \
@@ -34,6 +45,10 @@ jobs:
               -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
               -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
             cmake --build "/tmp/awslc-$variant-build" --target crypto --parallel "$(nproc)"
+            cmake -S "/tmp/awslc-$variant" -B "/tmp/awslc-$variant-native" -GNinja \
+              -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+              -DDISABLE_GO=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+            cmake --build "/tmp/awslc-$variant-native" --target crypto --parallel "$(nproc)"
           done
       - name: Differential atomic and fork scenarios — always capture both
         shell: bash
@@ -57,6 +72,73 @@ jobs:
             echo "$variant compile=$compile_rc run=$test_rc" | tee -a safety-results/status.txt
           done
           exit 0
+      - name: Active fork differential with child stage diagnostics
+        shell: bash
+        run: |
+          mkdir -p safety-results
+          set +e
+          for variant in base patch; do
+            lib="/tmp/awslc-$variant-build/crypto/libcrypto.a"
+            clang++ -g -O1 -std=c++17 -pthread -fsanitize=thread -fno-omit-frame-pointer \
+              -I"/tmp/awslc-$variant/include" research/active_fork_diagnostic.cc "$lib" \
+              -ldl -lm -lrt -latomic -o "/tmp/active-$variant" \
+              >"safety-results/active-compile-$variant.log" 2>&1
+            build_rc=$?
+            if [ "$build_rc" -eq 0 ]; then
+              TSAN_OPTIONS="halt_on_error=1:exitcode=66" timeout --kill-after=3s 45s \
+                "/tmp/active-$variant" 12 >"safety-results/active-run-$variant.log" 2>&1
+              run_rc=$?
+            else
+              run_rc=125
+            fi
+            echo "$variant build=$build_rc run=$run_rc" | tee -a safety-results/active-status.txt
+          done
+          exit 0
+      - name: Differential kernel-page reset and real active fork (all cases recorded)
+        shell: bash
+        run: |
+          set +e
+          mkdir -p safety-results
+          failures=0
+          for variant in base patch; do
+            lib="/tmp/awslc-$variant-native/crypto/libcrypto.a"
+            for kind in kernel_wipe_differential active_fork_diagnostic; do
+              clang++ -O2 -std=c++17 -pthread -I"/tmp/awslc-$variant/include" \
+                "research/${kind}.cc" "$lib" -ldl -lm -lrt -latomic \
+                -o "/tmp/${kind}-$variant" >"safety-results/build-${kind}-$variant.log" 2>&1
+              build_rc=$?
+              if [ "$build_rc" -eq 0 ]; then
+                case "$kind" in
+                  kernel_wipe_differential) iters=500;;
+                  active_fork_diagnostic) iters=20;;
+                esac
+                timeout --kill-after=3s 80s "/tmp/${kind}-$variant" "$iters" \
+                  >"safety-results/${kind}-$variant.log" 2>&1
+                run_rc=$?
+              else
+                run_rc=125
+              fi
+              echo "$variant $kind build=$build_rc run=$run_rc" | tee -a safety-results/differential-status.txt
+              if [ "$run_rc" -ne 0 ]; then failures=$((failures+1)); fi
+            done
+            lib="/tmp/awslc-$variant-build/crypto/libcrypto.a"
+            clang++ -g -O1 -std=c++17 -pthread -fsanitize=thread -fno-omit-frame-pointer \
+              -I"/tmp/awslc-$variant/include" research/kernel_wipe_differential.cc "$lib" \
+              -ldl -lm -lrt -latomic -o "/tmp/wipe-tsan-$variant" \
+              >"safety-results/build-wipe-tsan-$variant.log" 2>&1
+            build_rc=$?
+            if [ "$build_rc" -eq 0 ]; then
+              TSAN_OPTIONS="halt_on_error=1:exitcode=66" timeout --kill-after=3s 80s \
+                "/tmp/wipe-tsan-$variant" 200 >"safety-results/wipe-tsan-$variant.log" 2>&1
+              run_rc=$?
+            else
+              run_rc=125
+            fi
+            echo "$variant wipe-tsan build=$build_rc run=$run_rc" | tee -a safety-results/differential-status.txt
+            if [ "$run_rc" -ne 0 ]; then failures=$((failures+1)); fi
+          done
+          echo "failures=$failures" | tee -a safety-results/differential-status.txt
+          exit "$((failures>0))"
       - name: Collect compiler/OS and static memory-order evidence
         shell: bash
         run: |
