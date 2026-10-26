@@ -1,0 +1,50 @@
+name: AWS-LC upstream CI signoff
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  upstream:
+    name: upstream / ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [minimal, go]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install upstream prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build golang-go perl patch
+      - name: Checkout exact upstream baseline and apply patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          UPSTREAM_SHA=cd481c207e38f06aeb5766f4a1cdfce10a4c0af8
+          git clone https://github.com/aws/aws-lc.git /tmp/aws-lc-src
+          git -C /tmp/aws-lc-src checkout --detach "$UPSTREAM_SHA"
+          git -C /tmp/aws-lc-src submodule update --init --recursive
+          cd /tmp/aws-lc-src
+          patch -p1 --dry-run < "$GITHUB_WORKSPACE/research/atomic-fork-fastpath.patch"
+          patch -p1 < "$GITHUB_WORKSPACE/research/atomic-fork-fastpath.patch"
+      - name: Upstream CMake configuration and tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/upstream-results"
+          if [[ "${{ matrix.mode }}" == "minimal" ]]; then
+            cmake -S /tmp/aws-lc-src -B /tmp/aws-lc-build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=ON -DDISABLE_GO=ON
+            cmake --build /tmp/aws-lc-build --target run_minimal_tests --parallel "$(nproc)" 2>&1 | tee upstream-results/minimal.txt
+          else
+            cmake -S /tmp/aws-lc-src -B /tmp/aws-lc-build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=ON
+            cmake --build /tmp/aws-lc-build --target run_tests --parallel "$(nproc)" 2>&1 | tee upstream-results/go.txt
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upstream-${{ matrix.mode }}
+          path: upstream-results/
