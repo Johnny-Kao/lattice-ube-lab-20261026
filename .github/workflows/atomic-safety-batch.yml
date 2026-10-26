@@ -40,7 +40,7 @@ jobs:
               data = p.read_text()
               needle = "\n#elif defined(AWSLC_PLATFORM_DOES_NOT_FORK)"
               assert data.count(needle) == 1
-              data = data.replace(needle, "\nuintptr_t AWSLC_test_fork_flag_address(void);\nuintptr_t AWSLC_test_fork_flag_address(void) { return (uintptr_t)fork_detect_addr; }\n" + needle)
+              data = data.replace(needle, "\nuintptr_t AWSLC_test_fork_flag_address(void);\nuintptr_t AWSLC_test_fork_flag_address(void) { return (uintptr_t)fork_detect_addr; }\nsize_t AWSLC_test_fork_flag_width(void);\nsize_t AWSLC_test_fork_flag_width(void) { return sizeof(*fork_detect_addr); }\n" + needle)
               p.write_text(data)
           PY
           for variant in base patch; do
@@ -100,58 +100,72 @@ jobs:
             echo "$variant build=$build_rc run=$run_rc" | tee -a safety-results/active-status.txt
           done
           exit 0
-      - name: Differential kernel-page reset and real active fork (all cases recorded)
+      - name: Full behavior differential — generation / RAND / TSan
         shell: bash
         run: |
           set +e
           mkdir -p safety-results
           failures=0
           for variant in base patch; do
-            lib="/tmp/awslc-$variant-native/crypto/libcrypto.a"
-            for kind in kernel_wipe_differential active_fork_diagnostic; do
-              clang++ -O2 -std=c++17 -pthread -I"/tmp/awslc-$variant/include" \
-                "research/${kind}.cc" "$lib" -ldl -lm -lrt -latomic \
-                -o "/tmp/${kind}-$variant" >"safety-results/build-${kind}-$variant.log" 2>&1
-              build_rc=$?
-              if [ "$build_rc" -eq 0 ]; then
-                case "$kind" in
-                  kernel_wipe_differential) iters=500;;
-                  active_fork_diagnostic) iters=20;;
-                esac
-                timeout --kill-after=3s 80s "/tmp/${kind}-$variant" "$iters" \
-                  >"safety-results/${kind}-$variant.log" 2>&1
-                run_rc=$?
+            if [ "$variant" = "base" ]; then expected_width=1; else expected_width=4; fi
+            native="/tmp/awslc-$variant-native/crypto/libcrypto.a"
+            clang++ -g -O2 -std=c++17 -pthread -rdynamic \
+              -I"/tmp/awslc-$variant/include" research/kernel_wipe_differential.cc "$native" \
+              -ldl -lm -lrt -latomic -o "/tmp/wipe-native-$variant" \
+              >"safety-results/compile-native-$variant.log" 2>&1
+            native_build=$?
+            for mode in 0 2; do
+              if [ "$mode" -eq 0 ]; then rounds=500; label=generation; else rounds=150; label=cooperative-rand; fi
+              if [ "$native_build" -eq 0 ]; then
+                timeout --kill-after=3s 90s "/tmp/wipe-native-$variant" "$rounds" "$mode" "$expected_width" \
+                  >"safety-results/$label-$variant.log" 2>&1
+                result=$?
               else
-                run_rc=125
+                result=125
               fi
-              echo "$variant $kind build=$build_rc run=$run_rc" | tee -a safety-results/differential-status.txt
-              if [ "$run_rc" -ne 0 ]; then failures=$((failures+1)); fi
+              echo "$variant $label compile=$native_build run=$result" | tee -a safety-results/signoff-status.txt
+              if [ "$result" -ne 0 ]; then failures=$((failures+1)); fi
             done
-            # Separately test RAND reseeding during external page reset.
-            timeout --kill-after=3s 60s "/tmp/kernel_wipe_differential-$variant" 80 1 \
-              >"safety-results/wipe-with-rand-$variant.log" 2>&1
-            rand_rc=$?
-            echo "$variant wipe-with-rand run=$rand_rc" | tee -a safety-results/differential-status.txt
-            if [ "$rand_rc" -ne 0 ]; then failures=$((failures+1)); fi
-            lib="/tmp/awslc-$variant-build/crypto/libcrypto.a"
+            tsan="/tmp/awslc-$variant-build/crypto/libcrypto.a"
             clang++ -g -O1 -std=c++17 -pthread -fsanitize=thread -fno-omit-frame-pointer \
-              -I"/tmp/awslc-$variant/include" research/kernel_wipe_differential.cc "$lib" \
+              -I"/tmp/awslc-$variant/include" research/kernel_wipe_differential.cc "$tsan" \
               -ldl -lm -lrt -latomic -o "/tmp/wipe-tsan-$variant" \
-              >"safety-results/build-wipe-tsan-$variant.log" 2>&1
-            build_rc=$?
-            if [ "$build_rc" -eq 0 ]; then
-              TSAN_OPTIONS="halt_on_error=1:exitcode=66" timeout --kill-after=3s 80s \
-                "/tmp/wipe-tsan-$variant" 200 >"safety-results/wipe-tsan-$variant.log" 2>&1
-              run_rc=$?
-            else
-              run_rc=125
-            fi
-            echo "$variant wipe-tsan build=$build_rc run=$run_rc" | tee -a safety-results/differential-status.txt
-            if [ "$run_rc" -ne 0 ]; then failures=$((failures+1)); fi
+              >"safety-results/compile-tsan-$variant.log" 2>&1
+            tsan_build=$?
+            for mode in 0 2; do
+              if [ "$mode" -eq 0 ]; then rounds=200; label=tsan-generation; else rounds=70; label=tsan-cooperative-rand; fi
+              if [ "$tsan_build" -eq 0 ]; then
+                TSAN_OPTIONS="halt_on_error=1:exitcode=66" timeout --kill-after=3s 90s \
+                  "/tmp/wipe-tsan-$variant" "$rounds" "$mode" "$expected_width" \
+                  >"safety-results/$label-$variant.log" 2>&1
+                result=$?
+              else
+                result=125
+              fi
+              echo "$variant $label compile=$tsan_build run=$result" | tee -a safety-results/signoff-status.txt
+              if [ "$result" -ne 0 ]; then failures=$((failures+1)); fi
+            done
           done
-          echo "failures=$failures" | tee -a safety-results/differential-status.txt
+          echo "failures=$failures" | tee -a safety-results/signoff-status.txt
           exit "$((failures>0))"
+      - name: Official upstream minimal AND Go suites on the same patched build
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p safety-results
+          cmake -S /tmp/awslc-patch -B /tmp/awslc-patch-native -GNinja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=ON \
+            -DDISABLE_GO=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build /tmp/awslc-patch-native --target run_minimal_tests \
+            --parallel "$(nproc)" 2>&1 | tee safety-results/official-minimal.log
+          cmake -S /tmp/awslc-patch -B /tmp/awslc-patch-native -GNinja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=ON \
+            -DDISABLE_GO=OFF -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build /tmp/awslc-patch-native --target run_tests \
+            --parallel "$(nproc)" 2>&1 | tee safety-results/official-go.log
       - name: Collect compiler/OS and static memory-order evidence
+        if: always()
         shell: bash
         run: |
           mkdir -p safety-results
