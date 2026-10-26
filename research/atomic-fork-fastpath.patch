@@ -1,0 +1,96 @@
+diff --git a/crypto/ube/fork_ube_detect.c b/crypto/ube/fork_ube_detect.c
+--- a/crypto/ube/fork_ube_detect.c
++++ b/crypto/ube/fork_ube_detect.c
+@@ -43,8 +43,14 @@
+ static CRYPTO_once_t fork_detect_ube_once = CRYPTO_ONCE_INIT;
+ static struct CRYPTO_STATIC_MUTEX fork_detect_ube_lock = CRYPTO_STATIC_MUTEX_INIT;
+ 
++#if defined(OPENSSL_LINUX) && defined(OPENSSL_C11_ATOMIC) && \
++    ATOMIC_INT_LOCK_FREE == 2
++#define AWSLC_FORK_UBE_ATOMIC_FAST_PATH
++static _Atomic uint32_t *fork_detect_addr = NULL;
++#else
+ // This value (pointed to) is |volatile| because the value pointed to may be
+ // changed by external forces (i.e. the kernel wiping the page) thus the
+ // compiler must not assume that it has exclusive access to it.
+ static volatile char *fork_detect_addr = NULL;
++#endif
+ static uint64_t fgn = 0;
+@@ -195,8 +201,14 @@
+   // Next, try to initialize any defense-in-depth fork detection methods that
+   // might be available. Fail-open.
+   init_fork_detect_methods_best_effort(addr, page_size);
+ 
++#if defined(AWSLC_FORK_UBE_ATOMIC_FAST_PATH)
++  _Atomic uint32_t *atomic_addr = (_Atomic uint32_t *)addr;
++  atomic_init(atomic_addr, 1);
++  fork_detect_addr = atomic_addr;
++#else
+   *((volatile char *) addr) = 1;
+   fork_detect_addr = addr;
++#endif
+   fgn = 1;
+ }
+@@ -216,34 +228,62 @@
+   // One cannot convert this to thread-local values to avoid locking. See e.g.
+   // https://github.com/aws/s2n-tls/issues/3107.
+   CRYPTO_once(&fork_detect_ube_once, init_fork_detect);
++#if defined(AWSLC_FORK_UBE_ATOMIC_FAST_PATH)
++  _Atomic uint32_t *const flag_ptr = fork_detect_addr;
++#else
+   volatile char *const flag_ptr = fork_detect_addr;
++#endif
+   if (flag_ptr == NULL) {
+     // Our kernel does not support fork detection.
+     return 0;
+   }
+ 
+   struct CRYPTO_STATIC_MUTEX *const lock = &fork_detect_ube_lock;
+ 
++#if defined(AWSLC_FORK_UBE_ATOMIC_FAST_PATH)
++  // The common case is that no fork has occurred. Avoid touching the global
++  // rwlock in that case. The flag is published with release semantics after
++  // |fgn| is updated, and readers acquire the flag before reading |fgn|.
++  if (atomic_load_explicit(flag_ptr, memory_order_acquire) != 0) {
++    return fgn;
++  }
++
++  // A fork cleared the WIPEONFORK page. Multiple threads in the child may
++  // observe the zero, so serialize the generation update and re-check.
++  CRYPTO_STATIC_MUTEX_lock_write(lock);
++  uint64_t current_fgn = fgn;
++  if (atomic_load_explicit(flag_ptr, memory_order_relaxed) == 0) {
++    current_fgn++;
++    if (current_fgn == 0) {
++      current_fgn = 1;
++    }
++    fgn = current_fgn;
++    atomic_store_explicit(flag_ptr, 1, memory_order_release);
++  }
++  CRYPTO_STATIC_MUTEX_unlock_write(lock);
++  return current_fgn;
++#else
+   CRYPTO_STATIC_MUTEX_lock_read(lock);
+   uint64_t current_fgn = fgn;
+   if (*flag_ptr) {
+     CRYPTO_STATIC_MUTEX_unlock_read(lock);
+     return current_fgn;
+   }
+   CRYPTO_STATIC_MUTEX_unlock_read(lock);
+   CRYPTO_STATIC_MUTEX_lock_write(lock);
+   current_fgn = fgn;
+   if (*flag_ptr == 0) {
+     // A fork has occurred.
+     *flag_ptr = 1;
+ 
+     current_fgn++;
+     if (current_fgn == 0) {
+       current_fgn = 1;
+     }
+     fgn = current_fgn;
+   }
+   CRYPTO_STATIC_MUTEX_unlock_write(lock);
+ 
+   return current_fgn;
++#endif
+ }

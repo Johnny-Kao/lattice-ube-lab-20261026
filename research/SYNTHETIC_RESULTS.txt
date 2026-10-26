@@ -1,0 +1,15 @@
+# Local synthetic proxy results
+
+WARNING: This is a synchronization proxy, not an AWS-LC end-to-end benchmark.
+
+Environment:
+Linux 1f4eff603a61 6.18.55 #1 SMP Wed Oct 14 19:45:18 UTC 2026 x86_64 GNU/Linux
+
+mode=baseline threads=1 total_ops=500000 seconds=0.018619 ns_per_op=37.24 mops=26.854 sink=0
+mode=patched threads=1 total_ops=500000 seconds=0.009919 ns_per_op=19.84 mops=50.408 sink=0
+mode=baseline threads=2 total_ops=1000000 seconds=0.076065 ns_per_op=76.06 mops=13.147 sink=0
+mode=patched threads=2 total_ops=1000000 seconds=0.032531 ns_per_op=32.53 mops=30.740 sink=0
+mode=baseline threads=4 total_ops=2000000 seconds=0.238563 ns_per_op=119.28 mops=8.384 sink=0
+mode=patched threads=4 total_ops=2000000 seconds=0.141293 ns_per_op=70.65 mops=14.155 sink=0
+mode=baseline threads=8 total_ops=4000000 seconds=0.846986 ns_per_op=211.75 mops=4.723 sink=0
+mode=patched threads=8 total_ops=4000000 seconds=0.407243 ns_per_op=101.81 mops=9.822 sink=0

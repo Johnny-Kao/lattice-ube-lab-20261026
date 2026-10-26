@@ -1,0 +1,166 @@
+name: AWS-LC RAND UBE research
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout independent research repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build rsync python3 patch
+
+      - name: Bootstrap independent AWS-LC source snapshot if needed
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ ! -f crypto/ube/fork_ube_detect.c ]]; then
+            rm -rf /tmp/aws-lc-upstream
+            git clone --depth=1 --recurse-submodules --shallow-submodules \
+              https://github.com/aws/aws-lc.git /tmp/aws-lc-upstream
+            UPSTREAM_SHA="$(git -C /tmp/aws-lc-upstream rev-parse HEAD)"
+
+            # Copy the public upstream source into this independent repository.
+            # Do not copy upstream Git metadata or workflows. This repository is
+            # intentionally NOT a GitHub fork.
+            rsync -a \
+              --exclude='.git' \
+              --exclude='.github' \
+              /tmp/aws-lc-upstream/ ./
+            printf '%s\n' "$UPSTREAM_SHA" > research/UPSTREAM_COMMIT.txt
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "research: snapshot aws/aws-lc ${UPSTREAM_SHA} [skip ci]"
+            git push origin HEAD:main
+          else
+            if [[ ! -f research/UPSTREAM_COMMIT.txt ]]; then
+              printf '%s\n' "unknown-existing-snapshot" > research/UPSTREAM_COMMIT.txt
+            fi
+          fi
+
+      - name: Record environment
+        run: |
+          mkdir -p research-results
+          {
+            echo "date=$(date -u +%FT%TZ)"
+            echo "repo_sha=${GITHUB_SHA}"
+            echo "upstream_sha=$(cat research/UPSTREAM_COMMIT.txt)"
+            echo "nproc=$(nproc)"
+            uname -a
+            lscpu || true
+            cc --version | head -n 1
+            c++ --version | head -n 1
+            cmake --version | head -n 1
+            ninja --version
+          } | tee research-results/ENVIRONMENT.txt
+
+      - name: Prepare baseline and patched source trees
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf /tmp/awslc-baseline /tmp/awslc-patched
+          mkdir -p /tmp/awslc-baseline /tmp/awslc-patched
+          rsync -a --exclude='.git' --exclude='.github' --exclude='research-results' ./ /tmp/awslc-baseline/
+          rsync -a --exclude='.git' --exclude='.github' --exclude='research-results' ./ /tmp/awslc-patched/
+
+          cd /tmp/awslc-patched
+          patch -p1 --dry-run < "${GITHUB_WORKSPACE}/research/atomic-fork-fastpath.patch"
+          patch -p1 < "${GITHUB_WORKSPACE}/research/atomic-fork-fastpath.patch"
+          grep -n "AWSLC_FORK_UBE_ATOMIC_FAST_PATH" crypto/ube/fork_ube_detect.c
+
+      - name: Build baseline crypto
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S /tmp/awslc-baseline -B /tmp/build-baseline -GNinja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build /tmp/build-baseline --target crypto --parallel "$(nproc)"
+
+      - name: Build patched tree and tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S /tmp/awslc-patched -B /tmp/build-patched -GNinja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build /tmp/build-patched --parallel "$(nproc)"
+
+      - name: Compile research benchmark binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE_LIB="$(find /tmp/build-baseline -type f -name 'libcrypto.a' -print -quit)"
+          PATCH_LIB="$(find /tmp/build-patched -type f -name 'libcrypto.a' -print -quit)"
+          test -n "$BASE_LIB"
+          test -n "$PATCH_LIB"
+          echo "BASE_LIB=$BASE_LIB" >> "$GITHUB_ENV"
+          echo "PATCH_LIB=$PATCH_LIB" >> "$GITHUB_ENV"
+
+          c++ -O3 -std=c++17 -pthread \
+            -I/tmp/awslc-baseline/include \
+            research/bench_rand_bytes.cc "$BASE_LIB" \
+            -ldl -lm -lrt -latomic -o /tmp/bench-baseline
+
+          c++ -O3 -std=c++17 -pthread \
+            -I/tmp/awslc-patched/include \
+            research/bench_rand_bytes.cc "$PATCH_LIB" \
+            -ldl -lm -lrt -latomic -o /tmp/bench-patched
+
+          c++ -O2 -std=c++17 -pthread \
+            -I/tmp/awslc-baseline/include \
+            research/fork_rand_correctness.c "$BASE_LIB" \
+            -ldl -lm -lrt -latomic -o /tmp/fork-baseline
+
+          c++ -O2 -std=c++17 -pthread \
+            -I/tmp/awslc-patched/include \
+            research/fork_rand_correctness.c "$PATCH_LIB" \
+            -ldl -lm -lrt -latomic -o /tmp/fork-patched
+
+      - name: Fork correctness smoke test
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /tmp/fork-baseline 100 | tee research-results/fork-baseline.txt
+          /tmp/fork-patched 100 | tee research-results/fork-patched.txt
+
+      - name: Benchmark RAND_bytes baseline vs patched
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 research/run_rand_bench.py \
+            --baseline /tmp/bench-baseline \
+            --patched /tmp/bench-patched \
+            --out-dir research-results \
+            --repeats 7
+          cat research-results/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run AWS-LC test suite on patched build
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir /tmp/build-patched \
+            --output-on-failure --parallel "$(nproc)" \
+            2>&1 | tee research-results/ctest-patched.txt
+
+      - name: Upload research results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rand-ube-results
+          path: research-results/
+          if-no-files-found: warn
