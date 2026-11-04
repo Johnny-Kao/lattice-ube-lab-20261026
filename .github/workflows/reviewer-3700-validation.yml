@@ -9,7 +9,7 @@ permissions:
 jobs:
   reviewer-variant:
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 95
     steps:
       - uses: actions/checkout@v4
       - name: Check out exact PR head and make isolated variants
@@ -66,6 +66,70 @@ jobs:
           python3 research/run_rand_bench.py \
             --baseline /tmp/bench-head --patched /tmp/bench-review \
             --mode rand --repeats 7 --out-dir results/rand-benchmark
+      - name: Exact-source differential and ThreadSanitizer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p results/differential
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          for v in ("head", "review"):
+              src = Path("/tmp/aws-lc-" + v)
+              dst = Path("/tmp/aws-lc-tsan-" + v)
+              shutil.copytree(src, dst)
+              p = dst / "crypto/ube/fork_ube_detect.c"
+              body = p.read_text()
+              needle = "\n#elif defined(AWSLC_PLATFORM_DOES_NOT_FORK)"
+              assert body.count(needle) == 1
+              api = (
+                  "\nuintptr_t AWSLC_test_fork_flag_address(void);"
+                  "\nuintptr_t AWSLC_test_fork_flag_address(void) { return (uintptr_t)fork_detect_addr; }"
+                  "\nsize_t AWSLC_test_fork_flag_width(void);"
+                  "\nsize_t AWSLC_test_fork_flag_width(void) { return sizeof(*fork_detect_addr); }\n"
+              )
+              p.write_text(body.replace(needle, api + needle))
+          PY
+          for v in head review; do
+            cmake -S "/tmp/aws-lc-tsan-$v" -B "/tmp/aws-lc-tsan-$v-build" -GNinja \
+              -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+              -DDISABLE_GO=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+              -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+              -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+              -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+            cmake --build "/tmp/aws-lc-tsan-$v-build" --target crypto --parallel 4
+            clang++ -O1 -g -std=c++17 -pthread -fsanitize=thread -fno-omit-frame-pointer \
+              -I"/tmp/aws-lc-tsan-$v/include" research/kernel_wipe_differential.cc \
+              "/tmp/aws-lc-tsan-$v-build/crypto/libcrypto.a" \
+              -ldl -lm -lrt -latomic -o "/tmp/wipe-tsan-$v"
+            clang++ -O2 -std=c++17 -pthread \
+              -I"/tmp/aws-lc-tsan-$v/include" research/kernel_wipe_differential.cc \
+              "/tmp/aws-lc-$v-build/crypto/libcrypto.a" \
+              -ldl -lm -lrt -latomic -o "/tmp/wipe-native-$v"
+            for case in "native 0 500" "native 2 150" "tsan 0 200" "tsan 2 70"; do
+              read -r kind mode rounds <<<"$case"
+              bin="/tmp/wipe-$kind-$v"
+              if [ "$kind" = tsan ]; then
+                TSAN_OPTIONS="halt_on_error=1:exitcode=66" timeout --kill-after=3s 120s \
+                  "$bin" "$rounds" "$mode" 4 \
+                  >"results/differential/$v-$kind-$mode.log" 2>&1
+              else
+                timeout --kill-after=3s 120s "$bin" "$rounds" "$mode" 4 \
+                  >"results/differential/$v-$kind-$mode.log" 2>&1
+              fi
+              grep -F "RESULT passed=$rounds/$rounds" "results/differential/$v-$kind-$mode.log"
+              echo "PASS $v $kind mode=$mode rounds=$rounds" | tee -a results/differential/status.txt
+            done
+          done
+          test "$(wc -l < results/differential/status.txt)" -eq 8
+      - name: Paired CPU time peak RAM and throughput
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 research/reviewer_resource_bench.py \
+            --head /tmp/bench-head --review /tmp/bench-review \
+            --out results/resource --repeats 7
+          cat results/resource/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
       - name: Summary and evidence
         if: always()
         shell: bash
@@ -91,3 +155,39 @@ jobs:
           path: |
             reviewer-diff.patch
             results/
+
+  freebsd-fallback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check same source on real FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.5'
+          mem: 4096
+          cpu: 3
+          prepare: |
+            pkg install -y cmake ninja git
+          run: |
+            set -eu
+            freebsd-version
+            uname -a
+            sysctl hw.ncpu hw.physmem
+            git clone --filter=blob:none https://github.com/aws/aws-lc.git /tmp/aws-bsd-head
+            git -C /tmp/aws-bsd-head checkout --detach 632e337448a5a9fd9b8e85df92b340c3797e8aaa
+            cp -R /tmp/aws-bsd-head /tmp/aws-bsd-review
+            python3 research/reviewer_fgn_variant.py /tmp/aws-bsd-review/crypto/ube/fork_ube_detect.c
+            for variant in head review; do
+              git -C "/tmp/aws-bsd-$variant" submodule update --init --recursive
+              cmake -S "/tmp/aws-bsd-$variant" -B "/tmp/aws-bsd-$variant-build" -GNinja \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+                -DBUILD_TESTING=ON -DDISABLE_GO=ON
+              cmake --build "/tmp/aws-bsd-$variant-build" --target crypto --parallel 3
+              c++ -O2 -std=c++17 -pthread \
+                -I"/tmp/aws-bsd-$variant/include" research/first_read_after_fork.cc \
+                "/tmp/aws-bsd-$variant-build/crypto/libcrypto.a" \
+                -o "/tmp/bsd-fork-$variant"
+              "/tmp/bsd-fork-$variant" 30
+              echo "BSD PASS $variant"
+            done
