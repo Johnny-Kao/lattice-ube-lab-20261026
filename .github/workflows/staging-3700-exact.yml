@@ -1,0 +1,65 @@
+name: AWS-LC #3700 staging exact-commit validation
+on:
+  push:
+    paths:
+      - '.github/workflows/staging-3700-exact.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-staging:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and pin exact staging commit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none https://github.com/Johnny-Kao/aws-lc-staging.git /tmp/aws-lc-staging-exact
+          git -C /tmp/aws-lc-staging-exact checkout --detach d50fbf075a8789a65ae30531dc4f8b36a4a88043
+          test "$(git -C /tmp/aws-lc-staging-exact rev-parse HEAD)" = d50fbf075a8789a65ae30531dc4f8b36a4a88043
+          test "$(git -C /tmp/aws-lc-staging-exact rev-parse HEAD~2)" = 632e337448a5a9fd9b8e85df92b340c3797e8aaa
+          test "$(git -C /tmp/aws-lc-staging-exact diff --name-only HEAD~2 HEAD | sort)" = "$(printf '%s\n' crypto/ube/fork_ube_detect.c crypto/ube/fork_ube_detect_test.cc)"
+          git -C /tmp/aws-lc-staging-exact diff --check HEAD~2 HEAD
+          git -C /tmp/aws-lc-staging-exact submodule update --init --recursive
+          uname -a
+          nproc
+          mkdir -p results
+      - name: Compile, official integration test, minimal tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S /tmp/aws-lc-staging-exact -B /tmp/aws-lc-staging-build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=ON -DDISABLE_GO=ON \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build /tmp/aws-lc-staging-build --target crypto_test --parallel 4
+          timeout --kill-after=3s 120s /tmp/aws-lc-staging-build/crypto/crypto_test \
+            --gtest_filter=ForkDetect.SimultaneousFirstReadAfterFork:ForkDetect.Test \
+            2>&1 | tee results/fork-official.log
+          grep -F '[  PASSED  ] 2 tests.' results/fork-official.log
+          cmake --build /tmp/aws-lc-staging-build --target run_minimal_tests --parallel 4 \
+            2>&1 | tee results/minimal.log
+      - name: Standalone 60 x 8 first read regression
+        shell: bash
+        run: |
+          set -euxo pipefail
+          clang++ -O2 -std=c++17 -pthread \
+            -I/tmp/aws-lc-staging-exact/include research/first_read_after_fork.cc \
+            /tmp/aws-lc-staging-build/crypto/libcrypto.a \
+            -ldl -lm -lrt -latomic -o /tmp/first-read-staging
+          timeout --kill-after=3s 180s /tmp/first-read-staging 60 | tee results/first-read.log
+          grep -F 'PASS: 60 fresh child forks, 8 synchronized first readers each' results/first-read.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-3700-${{ matrix.arch }}
+          path: results/
