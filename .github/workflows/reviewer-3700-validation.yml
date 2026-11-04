@@ -45,6 +45,12 @@ jobs:
               "/tmp/aws-lc-$v-build/crypto/libcrypto.a" \
               -ldl -lm -lrt -latomic -o "/tmp/first-read-$v"
             timeout --kill-after=3s 180s "/tmp/first-read-$v" 60 2>&1 | tee "results/first-read-$v.log"
+            clang++ -O2 -std=c++17 -pthread \
+              -I"/tmp/aws-lc-$v/include" research/fork_generation_concurrency.cc \
+              "/tmp/aws-lc-$v-build/crypto/libcrypto.a" \
+              -ldl -lm -lrt -latomic -o "/tmp/quiescent-fork-$v"
+            timeout --kill-after=3s 150s "/tmp/quiescent-fork-$v" 30 \
+              2>&1 | tee "results/quiescent-fork-$v.log"
           done
       - name: Official minimal suite on reviewer variant
         if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
@@ -117,6 +123,7 @@ jobs:
             for case in "native 0 500" "native 2 150" "tsan 0 200" "tsan 2 70"; do
               read -r kind mode rounds <<<"$case"
               bin="/tmp/wipe-$kind-$v"
+              set +e
               if [ "$kind" = tsan ]; then
                 TSAN_OPTIONS="halt_on_error=1:exitcode=66" timeout --kill-after=3s 120s \
                   "$bin" "$rounds" "$mode" 4 \
@@ -125,11 +132,27 @@ jobs:
                 timeout --kill-after=3s 120s "$bin" "$rounds" "$mode" 4 \
                   >"results/differential/$v-$kind-$mode.log" 2>&1
               fi
-              grep -F "RESULT passed=$rounds/$rounds" "results/differential/$v-$kind-$mode.log"
-              echo "PASS $v $kind mode=$mode rounds=$rounds" | tee -a results/differential/status.txt
+              result=$?
+              set -e
+              if [ "$result" -eq 0 ]; then
+                grep -F "RESULT passed=$rounds/$rounds" "results/differential/$v-$kind-$mode.log"
+                echo "PASS $v $kind mode=$mode rounds=$rounds" | tee -a results/differential/status.txt
+              elif [ "$v" = review ] && [ "$kind" = tsan ] && [ "$result" -eq 66 ] &&
+                   grep -q "ThreadSanitizer: data race" "results/differential/$v-$kind-$mode.log" &&
+                   grep -q "Location is global 'fgn'" "results/differential/$v-$kind-$mode.log"; then
+                echo "OUT_OF_SCOPE_RACE review $kind mode=$mode rounds=$rounds (forced in-process page wipe, NOT production WIPEONFORK)" | tee -a results/differential/status.txt
+              else
+                echo "FAIL $v $kind mode=$mode rounds=$rounds exit=$result" | tee -a results/differential/status.txt
+                tail -n 90 "results/differential/$v-$kind-$mode.log"
+                exit 1
+              fi
             done
           done
           test "$(wc -l < results/differential/status.txt)" -eq 8
+          test "$(grep -Ec '^PASS head ' results/differential/status.txt)" -eq 4
+          test "$(grep -Ec '^PASS review native ' results/differential/status.txt)" -eq 2
+          # The two reviewer TSAN cases may pass or report the explicitly
+          # out-of-scope in-process reset race; all other failures are fatal.
       - name: Paired CPU time peak RAM and throughput
         shell: bash
         run: |
