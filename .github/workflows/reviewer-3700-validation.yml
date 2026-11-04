@@ -1,5 +1,8 @@
 name: AWS-LC #3700 reviewer research validation
 on:
+  push:
+    branches:
+      - research/aws-lc-3700-review-validation
   workflow_dispatch:
 permissions:
   contents: read
