@@ -8,6 +8,7 @@ permissions:
   contents: read
 jobs:
   reviewer-variant:
+    if: ${{ !contains(github.event.head_commit.message, '[bsd-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 95
     steps:
@@ -168,7 +169,7 @@ jobs:
           mem: 4096
           cpu: 3
           prepare: |
-            pkg install -y cmake ninja git
+            pkg install -y cmake ninja git python3
           run: |
             set -eu
             freebsd-version
