@@ -29,6 +29,7 @@ jobs:
             git -C "/tmp/aws-lc-$v" submodule update --init --recursive
           done
       - name: Build and run first-read regression on original and proposed variants
+        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -46,12 +47,14 @@ jobs:
             timeout --kill-after=3s 180s "/tmp/first-read-$v" 60 2>&1 | tee "results/first-read-$v.log"
           done
       - name: Official minimal suite on reviewer variant
+        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
         shell: bash
         run: |
           set -euxo pipefail
           cmake --build /tmp/aws-lc-review-build --target run_minimal_tests --parallel 4 \
             2>&1 | tee results/minimal-review.log
       - name: Repeat direct fork-generation performance comparison
+        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -92,6 +95,10 @@ jobs:
               p.write_text(body.replace(needle, api + needle))
           PY
           for v in head review; do
+            cmake -S "/tmp/aws-lc-tsan-$v" -B "/tmp/aws-lc-native-$v-build" -GNinja \
+              -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+              -DDISABLE_GO=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+            cmake --build "/tmp/aws-lc-native-$v-build" --target crypto --parallel 4
             cmake -S "/tmp/aws-lc-tsan-$v" -B "/tmp/aws-lc-tsan-$v-build" -GNinja \
               -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
               -DDISABLE_GO=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
@@ -105,7 +112,7 @@ jobs:
               -ldl -lm -lrt -latomic -o "/tmp/wipe-tsan-$v"
             clang++ -O2 -std=c++17 -pthread \
               -I"/tmp/aws-lc-tsan-$v/include" research/kernel_wipe_differential.cc \
-              "/tmp/aws-lc-$v-build/crypto/libcrypto.a" \
+              "/tmp/aws-lc-native-$v-build/crypto/libcrypto.a" \
               -ldl -lm -lrt -latomic -o "/tmp/wipe-native-$v"
             for case in "native 0 500" "native 2 150" "tsan 0 200" "tsan 2 70"; do
               read -r kind mode rounds <<<"$case"
@@ -127,6 +134,12 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          for v in head review; do
+            clang++ -O3 -std=c++17 -pthread \
+              -I"/tmp/aws-lc-tsan-$v/include" research/bench_rand_bytes.cc \
+              "/tmp/aws-lc-native-$v-build/crypto/libcrypto.a" \
+              -ldl -lm -lrt -latomic -o "/tmp/bench-$v"
+          done
           python3 research/reviewer_resource_bench.py \
             --head /tmp/bench-head --review /tmp/bench-review \
             --out results/resource --repeats 7
@@ -158,6 +171,7 @@ jobs:
             results/
 
   freebsd-fallback:
+    if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
