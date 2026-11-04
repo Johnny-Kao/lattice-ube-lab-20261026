@@ -1,0 +1,90 @@
+name: AWS-LC #3700 reviewer research validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reviewer-variant:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out exact PR head and make isolated variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none https://github.com/aws/aws-lc.git /tmp/aws-lc-head
+          git -C /tmp/aws-lc-head checkout --detach 632e337448a5a9fd9b8e85df92b340c3797e8aaa
+          test "$(git -C /tmp/aws-lc-head rev-parse HEAD)" = 632e337448a5a9fd9b8e85df92b340c3797e8aaa
+          cp -a /tmp/aws-lc-head /tmp/aws-lc-review
+          python3 research/reviewer_fgn_variant.py /tmp/aws-lc-review/crypto/ube/fork_ube_detect.c
+          git -C /tmp/aws-lc-review diff --check
+          git -C /tmp/aws-lc-review diff -- crypto/ube/fork_ube_detect.c | tee reviewer-diff.patch
+          test "$(git -C /tmp/aws-lc-review diff --name-only)" = crypto/ube/fork_ube_detect.c
+          for v in head review; do
+            git -C "/tmp/aws-lc-$v" submodule update --init --recursive
+          done
+      - name: Build and run first-read regression on original and proposed variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p results
+          for v in head review; do
+            cmake -S "/tmp/aws-lc-$v" -B "/tmp/aws-lc-$v-build" -GNinja \
+              -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+              -DBUILD_TESTING=ON -DDISABLE_GO=ON \
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+            cmake --build "/tmp/aws-lc-$v-build" --target crypto --parallel 4
+            clang++ -O2 -std=c++17 -pthread \
+              -I"/tmp/aws-lc-$v/include" research/first_read_after_fork.cc \
+              "/tmp/aws-lc-$v-build/crypto/libcrypto.a" \
+              -ldl -lm -lrt -latomic -o "/tmp/first-read-$v"
+            timeout --kill-after=3s 180s "/tmp/first-read-$v" 60 2>&1 | tee "results/first-read-$v.log"
+          done
+      - name: Official minimal suite on reviewer variant
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --build /tmp/aws-lc-review-build --target run_minimal_tests --parallel 4 \
+            2>&1 | tee results/minimal-review.log
+      - name: Repeat direct fork-generation performance comparison
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for v in head review; do
+            clang++ -O3 -std=c++17 -pthread \
+              -I"/tmp/aws-lc-$v/include" research/bench_rand_bytes.cc \
+              "/tmp/aws-lc-$v-build/crypto/libcrypto.a" \
+              -ldl -lm -lrt -latomic -o "/tmp/bench-$v"
+          done
+          python3 research/run_rand_bench.py \
+            --baseline /tmp/bench-head --patched /tmp/bench-review \
+            --mode fork --repeats 7 --out-dir results/fork-benchmark
+          python3 research/run_rand_bench.py \
+            --baseline /tmp/bench-head --patched /tmp/bench-review \
+            --mode rand --repeats 7 --out-dir results/rand-benchmark
+      - name: Summary and evidence
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## AWS-LC #3700 reviewer research'
+            echo 'Original PR head: 632e337448a5a9fd9b8e85df92b340c3797e8aaa'
+            echo 'Proposed variant generated from research/reviewer_fgn_variant.py'
+            for file in results/first-read-*.log; do
+              if [ -f "$file" ]; then
+                echo "### $file"
+                tail -n 5 "$file"
+              fi
+            done
+            for file in results/fork-benchmark/SUMMARY.md results/rand-benchmark/SUMMARY.md; do
+              if [ -f "$file" ]; then cat "$file"; fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aws-lc-3700-reviewer-evidence
+          path: |
+            reviewer-diff.patch
+            results/
