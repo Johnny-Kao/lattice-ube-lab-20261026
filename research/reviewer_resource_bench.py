@@ -19,9 +19,9 @@ def parse_time(path):
         if not m:
             raise ValueError(f"resource metric missing: {p}")
         return float(m.group(1))
-    return (val(r"User time \\(seconds\\):\\s*([0-9.]+)"),
-            val(r"System time \\(seconds\\):\\s*([0-9.]+)"),
-            val(r"Maximum resident set size \\(kbytes\\):\\s*([0-9.]+)"))
+    return (val(r"User time \(seconds\):\s*([0-9.]+)"),
+            val(r"System time \(seconds\):\s*([0-9.]+)"),
+            val(r"Maximum resident set size \(kbytes\):\s*([0-9.]+)"))
 
 def main():
     ap = argparse.ArgumentParser()
@@ -33,9 +33,9 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     cpuinfo = Path("/proc/cpuinfo").read_text()
-    model = re.search(r"^model name\\s*:\\s*(.+)$", cpuinfo, re.M)
+    model = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
     metadata = {"logical_cpus": os.cpu_count(), "cpu_model": model.group(1) if model else "unknown"}
-    (out / "environment.txt").write_text(str(metadata) + "\\n" + subprocess.check_output(["uname", "-a"], text=True))
+    (out / "environment.txt").write_text(str(metadata) + "\n" + subprocess.check_output(["uname", "-a"], text=True))
     rows = []
     for threads, size, iterations in [(1, 32, 200000), (4, 32, 200000), (8, 32, 200000),
                                        (4, 4096, 100000), (1, 0, 3000000), (4, 0, 3000000), (8, 0, 3000000)]:
@@ -53,7 +53,7 @@ def main():
                     user, system, rss = parse_time(resource_file)
                 finally:
                     os.unlink(resource_file)
-                kv = dict(re.findall(r"(\\w+)=([^ ]+)", output))
+                kv = dict(re.findall(r"(\w+)=([^ ]+)", output))
                 row = dict(variant=variant, repeat=rep, threads=threads, bytes=size,
                            iterations=iterations, user_cpu_s=user, system_cpu_s=system,
                            cpu_total_s=user+system, peak_rss_kib=rss,
@@ -66,19 +66,19 @@ def main():
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader(); w.writerows(rows)
     with (out / "SUMMARY.md").open("w") as f:
-        f.write("# Reviewer vs PR head: resource measurement\\n\\n")
+        f.write("# Reviewer vs PR head: resource measurement\n\n")
         f.write("Linux process wall and CPU seconds, /usr/bin/time peak RSS (KiB). "
                 "Same runner, sequential alternating A/B order; medians over "
-                f"{args.repeats} repetitions. Peak RSS is not allocations.\\n\\n")
-        f.write(f"CPU: {metadata['cpu_model']} | logical CPUs: {metadata['logical_cpus']}\\n\\n")
-        f.write("| Threads | Bytes | Variant | ns/op | ops/s | user+system CPU s | peak RSS KiB |\\n"
-                "|---:|---:|---|---:|---:|---:|---:|\\n")
+                f"{args.repeats} repetitions. Peak RSS is not allocations.\n\n")
+        f.write(f"CPU: {metadata['cpu_model']} | logical CPUs: {metadata['logical_cpus']}\n\n")
+        f.write("| Threads | Bytes | Variant | ns/op | ops/s | user+system CPU s | peak RSS KiB |\n"
+                "|---:|---:|---|---:|---:|---:|---:|\n")
         for threads, size, _ in [(1,32,0),(4,32,0),(8,32,0),(4,4096,0),(1,0,0),(4,0,0),(8,0,0)]:
             for variant in ("head", "review"):
                 rr = [r for r in rows if r["threads"] == threads and r["bytes"] == size and r["variant"] == variant]
                 med = lambda name: statistics.median(r[name] for r in rr)
                 f.write(f"| {threads} | {size} | {variant} | {med('ns_per_op'):.2f} | "
                         f"{med('ops_per_s'):.0f} | {med('cpu_total_s'):.3f} | "
-                        f"{med('peak_rss_kib'):.0f} |\\n")
+                        f"{med('peak_rss_kib'):.0f} |\n")
 if __name__ == "__main__":
     main()
