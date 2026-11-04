@@ -28,8 +28,28 @@ jobs:
           for v in head review; do
             git -C "/tmp/aws-lc-$v" submodule update --init --recursive
           done
+      - name: Official upstream GTest integration for reviewer regression
+        if: ${{ contains(github.event.head_commit.message, '[official-test]') }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p results
+          python3 research/integrate_reviewer_fork_test.py \
+            /tmp/aws-lc-review/crypto/ube/fork_ube_detect_test.cc
+          git -C /tmp/aws-lc-review diff --check
+          git -C /tmp/aws-lc-review diff -- crypto/ube/fork_ube_detect_test.cc \
+            | tee results/official-regression.patch
+          cmake -S /tmp/aws-lc-review -B /tmp/aws-lc-officialtest-build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=ON -DDISABLE_GO=ON \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build /tmp/aws-lc-officialtest-build --target crypto_test --parallel 4
+          timeout --kill-after=3s 120s /tmp/aws-lc-officialtest-build/crypto/crypto_test \
+            --gtest_filter=ForkDetect.SimultaneousFirstReadAfterFork \
+            2>&1 | tee results/official-regression.log
+          grep -F '[  PASSED  ] 1 test.' results/official-regression.log
       - name: Build and run first-read regression on original and proposed variants
-        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
+        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') && !contains(github.event.head_commit.message, '[official-test]') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -53,14 +73,14 @@ jobs:
               2>&1 | tee "results/quiescent-fork-$v.log"
           done
       - name: Official minimal suite on reviewer variant
-        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
+        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') && !contains(github.event.head_commit.message, '[official-test]') }}
         shell: bash
         run: |
           set -euxo pipefail
           cmake --build /tmp/aws-lc-review-build --target run_minimal_tests --parallel 4 \
             2>&1 | tee results/minimal-review.log
       - name: Repeat direct fork-generation performance comparison
-        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
+        if: ${{ !contains(github.event.head_commit.message, '[deep-only]') && !contains(github.event.head_commit.message, '[official-test]') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -77,6 +97,7 @@ jobs:
             --baseline /tmp/bench-head --patched /tmp/bench-review \
             --mode rand --repeats 7 --out-dir results/rand-benchmark
       - name: Exact-source differential and ThreadSanitizer
+        if: ${{ !contains(github.event.head_commit.message, '[official-test]') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -154,6 +175,7 @@ jobs:
           # The two reviewer TSAN cases may pass or report the explicitly
           # out-of-scope in-process reset race; all other failures are fatal.
       - name: Paired CPU time peak RAM and throughput
+        if: ${{ !contains(github.event.head_commit.message, '[official-test]') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -194,7 +216,7 @@ jobs:
             results/
 
   freebsd-fallback:
-    if: ${{ !contains(github.event.head_commit.message, '[deep-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[deep-only]') && !contains(github.event.head_commit.message, '[official-test]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
